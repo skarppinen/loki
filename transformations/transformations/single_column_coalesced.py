@@ -13,8 +13,12 @@ from loki import (
     FindExpressions, SymbolAttributes, BasicType, SubstituteExpressions, DerivedType,
     FindVariables, CaseInsensitiveDict, pragma_regions_attached, PragmaRegion, is_loki_pragma
 )
+from loki.transform import (
+    HoistVariablesTransformation
+)
 
-__all__ = ['SCCBaseTransformation', 'SCCAnnotateTransformation', 'SCCHoistTransformation']
+__all__ = ['SCCBaseTransformation', 'SCCAnnotateTransformation', 'SCCHoistTransformation',
+           'RecursiveSCCHoistTransformation']
 
 
 class SCCBaseTransformation(Transformation):
@@ -592,6 +596,76 @@ class SCCAnnotateTransformation(Transformation):
                     driver_loop._update(pragma=(driver_loop.pragma[0], ir.Pragma(keyword='acc', content=p_content)))
                     driver_loop._update(pragma_post=(ir.Pragma(keyword='acc', content='end parallel loop'),
                                               driver_loop.pragma_post[0]))
+
+
+
+class RecursiveSCCHoistTransformation(Transformation):
+    def __init__(self, horizontal, vertical, block_dim):
+        self.horizontal = horizontal
+        self.vertical = vertical
+        self.block_dim = block_dim
+        self.transform = HoistVariablesTransformation() 
+
+    @classmethod
+    def add_loop_index_to_args(cls, v_index, routine):
+        """
+        Add loop index to routine arguments.
+
+        Parameters
+        ----------
+        routine : :any:`Subroutine`
+            The subroutine to modify.
+        v_index : :any:`Scalar`
+            The induction variable for the promoted horizontal loops.
+        """
+
+        new_v = v_index.clone(type=v_index.type.clone(intent='in'))
+        # Remove original variable first, since we need to update declaration
+        routine.variables = as_tuple(v for v in routine.variables if v != v_index)
+        routine.arguments += as_tuple(new_v)
+
+    def transform_subroutine(self, routine, **kwargs):
+        """
+        TODO: Document + Assumes trafo_data populated
+        """
+        role = kwargs['role']
+
+        # Dispatch to 'HoistVariablesTransformation' to transform routines.
+        self.transform.transform_subroutine(routine, **kwargs)
+        
+        # Then do additional processing:
+        if role == "kernel":
+            # Add loop index variable.
+            v_index = SCCBaseTransformation.get_integer_variable(routine, name=self.horizontal.index)
+            if v_index not in routine.arguments:
+                self.add_loop_index_to_args(v_index, routine)
+
+
+
+    #def process_kernel(self, routine, item, successors):
+    #    """
+    #    Applies the RecursiveSCCHoist utilities to a "kernel". It is assumed that an analysis pass has been run via 
+    #    `HoistTemporaryArraysAnalysis` that records the arrays to be hoisted to `item.trafo_data`. 
+
+    #    Parameters
+    #    ----------
+    #    routine : :any:`Subroutine`
+    #        Subroutine to apply this transformation to.
+    #    """
+
+    #    # Add all array temporaries (from current routine and all its children) to the arguments
+    #    # of the current routine.
+    #    to_hoist = item.trafo_data['HoistTemporaryArraysTransformation']['to_hoist']
+    #    promoted = [v.clone(type=v.type.clone(intent='INOUT')) for v in to_hoist]
+    #    routine.arguments += as_tuple(promoted)
+
+    #    # Modify all child subroutine calls occuring during this routine to include their hoisted temporary arrays. 
+    #    # TODO.
+
+    #    # Add loop horizontal index to arguments. 
+    #    v_index = SCCBaseTransformation.get_integer_variable(routine, name=self.horizontal.index)
+    #    if v_index not in routine.arguments:
+    #        self.add_loop_index_to_args(v_index, routine)
 
 
 class SCCHoistTransformation(Transformation):
