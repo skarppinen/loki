@@ -597,14 +597,57 @@ class SCCAnnotateTransformation(Transformation):
                     driver_loop._update(pragma_post=(ir.Pragma(keyword='acc', content='end parallel loop'),
                                               driver_loop.pragma_post[0]))
 
+def filter_column_locals(variables, vertical):
+        """
+        List of array variables that include a `vertical` dimension and
+        thus need to be stored in shared memory.
+
+        Parameters
+        ----------
+        routine : :any:`Subroutine`
+            The subroutine in the vector loops should be removed.
+        vertical: :any:`Dimension`
+            The dimension object specifying the vertical dimension
+        """
+
+        # Filter out purely local array variables
+        variables = [v for v in variables if isinstance(v, sym.Array)]
+        variables = [v for v in variables if any(vertical.size in d for d in v.shape)]
+        return variables
 
 
 class RecursiveSCCHoistTransformation(Transformation):
+    _key = "SCCHoistTransformation" 
+
     def __init__(self, horizontal, vertical, block_dim):
         self.horizontal = horizontal
         self.vertical = vertical
         self.block_dim = block_dim
-        self.transform = HoistVariablesTransformation() 
+            
+
+    @classmethod
+    def get_column_locals(cls, routine, vertical):
+        """
+        List of array variables that include a `vertical` dimension and
+        thus need to be stored in shared memory.
+
+        Parameters
+        ----------
+        routine : :any:`Subroutine`
+            The subroutine in the vector loops should be removed.
+        vertical: :any:`Dimension`
+            The dimension object specifying the vertical dimension
+        """
+        variables = list(routine.variables)
+
+        # Filter out purely local array variables
+        argument_map = CaseInsensitiveDict({a.name: a for a in routine.arguments})
+        variables = [v for v in variables if not v.name in argument_map]
+        variables = [v for v in variables if isinstance(v, sym.Array)]
+
+        variables = [v for v in variables if any(vertical.size in d for d in v.shape)]
+
+        return variables
 
     @classmethod
     def add_loop_index_to_args(cls, v_index, routine):
@@ -624,50 +667,121 @@ class RecursiveSCCHoistTransformation(Transformation):
         routine.variables = as_tuple(v for v in routine.variables if v != v_index)
         routine.arguments += as_tuple(new_v)
 
+    @classmethod
+    def hoist_driver_temporary_arrays(cls, routine, call, horizontal, vertical, block_dim, item=None):
+        """
+        Hoist temporary column arrays to the driver level.
+
+        Note that this employs an interprocedural analysis pass
+        (forward), and thus needs to be executed for the calling
+        driver routine before any of the kernels are processed.
+
+        Parameters
+        ----------
+        routine : :any:`Subroutine`
+            Subroutine to apply this transformation to.
+        call : :any:`CallStatement`
+            Call to subroutine from which we hoist the column arrays.
+        horizontal: :any:`Dimension`
+            The dimension object specifying the horizontal vector dimension
+        vertical: :any:`Dimension`
+            The dimension object specifying the vertical loop dimension
+        block_dim : :any:`Dimension`
+            ``Dimension`` object to define the blocking dimension
+            to use for hoisted column arrays if hoisting is enabled.
+        item : :any:`Item`
+            Scheduler work item corresponding to routine.
+        """
+
+        if call.not_active or call.routine is BasicType.DEFERRED:
+            raise RuntimeError(
+                '[Loki] SingleColumnCoalescedTransform: Target kernel is not attached '
+                'to call in driver routine.'
+            )
+
+        if not block_dim:
+            raise RuntimeError(
+                '[Loki] SingleColumnCoalescedTransform: No blocking dimension found '
+                'for column hoisting.'
+            )
+
+        kernel = call.routine
+        call_map = {}
+        hoist_variables = item.trafo_data["HoistVariablesTransformation"]["hoist_variables"]
+
+        column_locals = filter_column_locals(hoist_variables, 
+                                             vertical=vertical)
+        arg_map = dict(call.arg_iter())
+        arg_mapper = SubstituteExpressions(arg_map)
+
+        # Create a driver-level buffer variable for all promoted column arrays
+        # TODO: Note that this does not recurse into the kernels yet!
+        block_var = SCCBaseTransformation.get_integer_variable(routine, block_dim.size)
+        arg_dims = [v.shape + (block_var,) for v in column_locals]
+        # Translate shape variables back to caller's namespace
+        routine.variables += as_tuple(v.clone(dimensions=arg_mapper.visit(dims), scope=routine)
+                                      for v, dims in zip(column_locals, arg_dims))
+
+        # Add column_locals to trafo_data for offload annotations in SCCAnnotate
+        if item:
+            item.trafo_data[cls._key]['column_locals'] += column_locals
+
+        # Add a block-indexed slice of each column variable to the call
+        idx = SCCBaseTransformation.get_integer_variable(routine, block_dim.index)
+        new_args = [v.clone(
+            dimensions=as_tuple([sym.RangeIndex((None, None)) for _ in v.shape]) + (idx,),
+            scope=routine
+        ) for v in column_locals]
+        new_call = call.clone(arguments=call.arguments + as_tuple(new_args))
+
+        info(f'[Loki-SCC::Hoist] Hoisted variables in call {routine.name} => {call.name}:'
+             f'{", ".join(v.name for v in column_locals)}')
+
+        # Find the iteration index variable for the specified horizontal
+        v_index = SCCBaseTransformation.get_integer_variable(routine, name=horizontal.index)
+        if v_index.name not in routine.variable_map:
+            routine.variables += as_tuple(v_index)
+
+        # Append new loop variable to call signature
+        new_call._update(kwarguments=new_call.kwarguments + ((horizontal.index, v_index),))
+
+        # Now create a vector loop around the kernel invocation
+        v_start = arg_map[kernel.variable_map[horizontal.bounds[0]]]
+        v_end = arg_map[kernel.variable_map[horizontal.bounds[1]]]
+        bounds = sym.LoopRange((v_start, v_end))
+        vector_loop = ir.Loop(variable=v_index, bounds=bounds, body=(new_call,))
+        call_map[call] = vector_loop
+
+        routine.body = Transformer(call_map).visit(routine.body)
+
     def transform_subroutine(self, routine, **kwargs):
         """
         TODO: Document + Assumes trafo_data populated
         """
-        role = kwargs['role']
 
-        # Dispatch to 'HoistVariablesTransformation' to transform routines.
-        self.transform.transform_subroutine(routine, **kwargs)
-        
-        # Then do additional processing:
+        item = kwargs.get('item', None)
+        role = item.role 
+        targets = item.targets #kwargs.get('targets', None)
+                
         if role == "kernel":
+            # Dispatch to 'HoistVariablesTransformation' to transform routine if it is a kernel.
+            HoistVariablesTransformation().transform_subroutine(routine, **kwargs)
+
             # Add loop index variable.
             v_index = SCCBaseTransformation.get_integer_variable(routine, name=self.horizontal.index)
             if v_index not in routine.arguments:
                 self.add_loop_index_to_args(v_index, routine)
+        else: 
+            if item:
+                item.trafo_data[self._key] = {'column_locals': []}
 
-
-
-    #def process_kernel(self, routine, item, successors):
-    #    """
-    #    Applies the RecursiveSCCHoist utilities to a "kernel". It is assumed that an analysis pass has been run via 
-    #    `HoistTemporaryArraysAnalysis` that records the arrays to be hoisted to `item.trafo_data`. 
-
-    #    Parameters
-    #    ----------
-    #    routine : :any:`Subroutine`
-    #        Subroutine to apply this transformation to.
-    #    """
-
-    #    # Add all array temporaries (from current routine and all its children) to the arguments
-    #    # of the current routine.
-    #    to_hoist = item.trafo_data['HoistTemporaryArraysTransformation']['to_hoist']
-    #    promoted = [v.clone(type=v.type.clone(intent='INOUT')) for v in to_hoist]
-    #    routine.arguments += as_tuple(promoted)
-
-    #    # Modify all child subroutine calls occuring during this routine to include their hoisted temporary arrays. 
-    #    # TODO.
-
-    #    # Add loop horizontal index to arguments. 
-    #    v_index = SCCBaseTransformation.get_integer_variable(routine, name=self.horizontal.index)
-    #    if v_index not in routine.arguments:
-    #        self.add_loop_index_to_args(v_index, routine)
-
-
+            # Apply hoisting of temporary "column arrays"
+            for call in FindNodes(ir.CallStatement).visit(routine.body):
+                if not call.name in targets:
+                    continue
+                self.hoist_driver_temporary_arrays(routine, call, self.horizontal, self.vertical,
+                                                   self.block_dim, item=item)
+   
 class SCCHoistTransformation(Transformation):
     """
     A transformation to promote all local arrays with column dimensions to arguments.
