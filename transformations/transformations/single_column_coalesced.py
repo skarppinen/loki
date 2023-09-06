@@ -14,7 +14,8 @@ from loki import (
     FindVariables, CaseInsensitiveDict, pragma_regions_attached, PragmaRegion, is_loki_pragma
 )
 from loki.transform import (
-    HoistVariablesTransformation
+    HoistVariablesTransformation,
+    single_variable_declaration
 )
 
 __all__ = ['SCCBaseTransformation', 'SCCAnnotateTransformation', 'SCCHoistTransformation',
@@ -771,6 +772,7 @@ class RecursiveSCCHoistTransformation(Transformation):
             v_index = SCCBaseTransformation.get_integer_variable(routine, name=self.horizontal.index)
             if v_index not in routine.arguments:
                 self.add_loop_index_to_args(v_index, routine)
+            single_variable_declaration(routine)
         else: 
             if item:
                 item.trafo_data[self._key] = {'column_locals': []}
