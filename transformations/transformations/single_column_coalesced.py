@@ -708,10 +708,11 @@ class RecursiveSCCHoistTransformation(Transformation):
 
         kernel = call.routine
         call_map = {}
-        hoist_variables = item.trafo_data["HoistVariablesTransformation"]["hoist_variables"]
+        column_locals = item.trafo_data["HoistVariablesTransformation"]["hoist_variables"]
 
-        column_locals = filter_column_locals(hoist_variables, 
-                                             vertical=vertical)
+        #column_locals = filter_column_locals(hoist_variables, 
+        #                                     vertical=vertical)
+
         arg_map = dict(call.arg_iter())
         arg_mapper = SubstituteExpressions(arg_map)
 
