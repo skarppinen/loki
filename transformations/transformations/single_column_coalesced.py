@@ -762,21 +762,32 @@ class RecursiveSCCHoistTransformation(Transformation):
 
         item = kwargs.get('item', None)
         role = item.role 
-        targets = item.targets #kwargs.get('targets', None)
                 
         if role == "kernel":
-            # Dispatch to 'HoistVariablesTransformation' to transform routine if it is a kernel.
+            # 'HoistVariablesTransformation' does most to transform a kernel routine.
             HoistVariablesTransformation().transform_subroutine(routine, **kwargs)
 
-            # Add loop index variable.
-            v_index = SCCBaseTransformation.get_integer_variable(routine, name=self.horizontal.index)
-            if v_index not in routine.arguments:
-                self.add_loop_index_to_args(v_index, routine)
+            # Need still to add the horizontal index to all calls and the arguments of the routine.
+            h_index = SCCBaseTransformation.get_integer_variable(routine, name=self.horizontal.index)
+            
+            # Add horizontal index to all calls (TODO: should look at targets to filter calls?).
+            call_map = {}
+            for call in FindNodes(ir.CallStatement).visit(routine.body):
+                if not h_index in call.arguments:
+                    call_map[call] = call.clone(arguments = call.arguments + (h_index.clone(),))
+            routine.body = Transformer(call_map).visit(routine.body)
+
+            # Add the horizontal index to dummy arguments. 
+            if h_index not in routine.arguments:
+                self.add_loop_index_to_args(h_index, routine)
+
+            # Separate all variable declarations to their own lines. 
+            # This would not be strictly necessary, but is done to avoid errors when writing transformed source.
             single_variable_declaration(routine)
         else: 
             if item:
                 item.trafo_data[self._key] = {'column_locals': []}
-
+            targets = item.targets 
             # Apply hoisting of temporary "column arrays"
             for call in FindNodes(ir.CallStatement).visit(routine.body):
                 if not call.name in targets:
