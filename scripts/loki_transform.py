@@ -12,7 +12,6 @@ Loki head script for source-to-source transformations concerning ECMWF
 physics, including "Single Column" (SCA) and CLAW transformations.
 """
 
-import sys
 from pathlib import Path
 import click
 
@@ -29,9 +28,6 @@ from loki.transform import (
 )
 
 # pylint: disable=wrong-import-order
-from transformations.argument_shape import (
-    ArgumentArrayShapeAnalysis, ExplicitArgumentArrayShapeTransformation
-)
 from transformations.data_offload import DataOffloadTransformation, GlobalVarOffloadTransformation
 from transformations.derived_types import DerivedTypeArgumentsTransformation
 from transformations.utility_routines import DrHookTransformation, RemoveCallsTransformation
@@ -96,6 +92,8 @@ def cli(debug):
               help='Run transformation to insert custom data offload regions.')
 @click.option('--remove-openmp', is_flag=True, default=False,
               help='Removes existing OpenMP pragmas in "!$loki data" regions.')
+@click.option('--assume-deviceptr', is_flag=True, default=False,
+              help='Mark the relevant arguments as true device-pointers in "!$loki data" regions.')
 @click.option('--frontend', default='fp', type=click.Choice(['fp', 'ofp', 'omni']),
               help='Frontend parser to use (default FP)')
 @click.option('--trim-vector-sections', is_flag=True, default=False,
@@ -104,10 +102,12 @@ def cli(debug):
               help="Generate offload instructions for global vars imported via 'USE' statements.")
 @click.option('--remove-derived-args/--no-remove-derived-args', default=False,
               help="Remove derived-type arguments and replace with canonical arguments")
+@click.option('--inline-members/--no-inline-members', default=False,
+              help='Inline member functions for SCC-class transformations.')
 def convert(
         mode, config, build, source, header, cpp, directive, include, define, omni_include, xmod,
-        data_offload, remove_openmp, frontend, trim_vector_sections,
-        global_var_offload, remove_derived_args
+        data_offload, remove_openmp, assume_deviceptr, frontend, trim_vector_sections,
+        global_var_offload, remove_derived_args, inline_members
 ):
     """
     Batch-processing mode for Fortran-to-Fortran transformations that
@@ -169,7 +169,7 @@ def convert(
     # Insert data offload regions for GPUs and remove OpenMP threading directives
     use_claw_offload = True
     if data_offload:
-        offload_transform = DataOffloadTransformation(remove_openmp=remove_openmp)
+        offload_transform = DataOffloadTransformation(remove_openmp=remove_openmp, assume_deviceptr=assume_deviceptr)
         scheduler.process(transformation=offload_transform)
         use_claw_offload = not offload_transform.has_data_regions
 
@@ -192,7 +192,9 @@ def convert(
         horizontal = scheduler.config.dimensions['horizontal']
         vertical = scheduler.config.dimensions['vertical']
         block_dim = scheduler.config.dimensions['block_dim']
-        transformation = (SCCBaseTransformation(horizontal=horizontal, directive=directive),)
+        transformation = (SCCBaseTransformation(
+            horizontal=horizontal, directive=directive, inline_members=inline_members
+        ),)
         transformation += (SCCDevectorTransformation(horizontal=horizontal, trim_vector_sections=trim_vector_sections),)
         transformation += (SCCDemoteTransformation(horizontal=horizontal),)
         if not 'hoist' in mode:
@@ -258,12 +260,16 @@ def convert(
     mode = mode.replace('-', '_')  # Sanitize mode string
     dependency = DependencyTransformation(suffix=f'_{mode.upper()}',
                                           mode='module', module_suffix='_MOD')
-    scheduler.process(transformation=dependency)
+    scheduler.process(transformation=dependency, use_file_graph=True)
 
     # Write out all modified source files into the build directory
+    if global_var_offload:
+        item_filter = (SubroutineItem, GlobalVarImportItem)
+    else:
+        item_filter = SubroutineItem
     scheduler.process(
         transformation=FileWriteTransformation(builddir=build, mode=mode, cuf='cuf' in mode),
-        use_file_graph=True
+        use_file_graph=True, item_filter=item_filter
     )
 
 
@@ -318,8 +324,9 @@ def transpile(out_path, header, source, driver, cpp, include, define, frontend, 
     driver_item = SubroutineItem(f'#{driver_name.lower()}', source=driver)
 
     # First, remove all derived-type arguments; caller first!
-    kernel.apply(DerivedTypeArgumentsTransformation(), role='kernel', item=kernel_item)
-    driver.apply(DerivedTypeArgumentsTransformation(), role='driver', item=driver_item, successors=(kernel_item,))
+    transformation = DerivedTypeArgumentsTransformation()
+    kernel[kernel_name].apply(transformation, role='kernel', item=kernel_item)
+    driver[driver_name].apply(transformation, role='driver', item=driver_item, successors=(kernel_item,))
 
     # Now we instantiate our pipeline and apply the changes
     transformation = FortranCTransformation()
@@ -331,7 +338,7 @@ def transpile(out_path, header, source, driver, cpp, include, define, frontend, 
 
     # Housekeeping: Inject our re-named kernel and auto-wrapped it in a module
     dependency = DependencyTransformation(suffix='_FC', mode='module', module_suffix='_MOD')
-    kernel.apply(dependency, role='kernel')
+    kernel.apply(dependency, role='kernel', targets=())
     kernel.write(path=Path(out_path)/kernel.path.with_suffix('.c.F90').name)
 
     # Re-generate the driver that mimicks the original source file,

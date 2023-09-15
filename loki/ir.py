@@ -166,6 +166,15 @@ class Node:
         from loki.visitors import pprint
         pprint(self)
 
+    def ir_graph(self, show_comments=False, show_expressions=False, linewidth=40, symgen=str):
+        """
+        Get the IR graph to visualize the node hierachy under this node.
+        """
+        # pylint: disable=import-outside-toplevel,cyclic-import
+        from loki.visitors.ir_graph import ir_graph
+
+        return ir_graph(self, show_comments, show_expressions,linewidth, symgen)
+
     @property
     def live_symbols(self):
         """
@@ -911,6 +920,14 @@ class CallStatement(LeafNode, _CallStatementBase):
         args = zip(routine.arguments, self.arguments)
         kwargs = ((r_args[kw], arg) for kw, arg in as_tuple(self.kwarguments))
         return chain(args, kwargs)
+
+    @property
+    def arg_map(self):
+        """
+        A full map of all qualified argument matches from arguments
+        and keyword arguments.
+        """
+        return dict(self.arg_iter())
 
 
 @dataclass_strict(frozen=True)

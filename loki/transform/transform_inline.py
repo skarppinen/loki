@@ -12,15 +12,20 @@ Collection of utility routines to perform code-level force-inlining.
 """
 from loki.expression import (
     FindVariables, FindInlineCalls, FindLiterals,
-    SubstituteExpressions, LokiIdentityMapper
+    SubstituteExpressions, SubstituteExpressionsMapper, LokiIdentityMapper
 )
-from loki.ir import Import, Comment, Assignment
+from loki.ir import Import, Comment, Assignment, VariableDeclaration, CallStatement
 from loki.expression import symbols as sym
 from loki.types import BasicType
 from loki.visitors import Transformer, FindNodes
+from loki.tools import as_tuple
+from loki.logging import warning
 
 
-__all__ = ['inline_constant_parameters', 'inline_elemental_functions']
+__all__ = [
+    'inline_constant_parameters', 'inline_elemental_functions',
+    'inline_member_procedures'
+]
 
 
 class InlineSubstitutionMapper(LokiIdentityMapper):
@@ -183,3 +188,98 @@ def inline_elemental_functions(routine):
         if all(hasattr(s, 'type') and s.type.dtype in removed_functions for s in im.symbols):
             import_map[im] = None
     routine.spec = Transformer(import_map).visit(routine.spec)
+
+
+def inline_member_routine(routine, member):
+    """
+    Inline an individual member :any:`Subroutine` at source level.
+
+    This will replace all :any:`Call` objects to the specified
+    subroutine with an adjusted equivalent of the member routines'
+    body. For this, argument matching, including partial dimension
+    matching for array references is performed, and all
+    member-specific declarations are hoisted to the containing
+    :any:`Subroutine`.
+
+    Parameters
+    ----------
+    routine : :any:`Subroutine`
+        The subroutine in which to inline all calls to the member routine
+    member : :any:`Subroutine`
+        The contained member subroutine to be inlined in the parent
+    """
+
+    def _map_unbound_dims(var, val):
+        """
+        Maps all unbound dimension ranges in the passed array value
+        ``val`` with the indices from the local variable ``var``. It
+        returns the re-mapped symbol.
+
+        For example, mapping the passed array ``m(:,j)`` to the local
+        expression ``a(i)`` yields ``m(i,j)``.
+        """
+        val_free_dims = tuple(d for d in val.dimensions if isinstance(d, sym.Range))
+        var_bound_dims = tuple(d for d in var.dimensions if not isinstance(d, sym.Range))
+        mapper = SubstituteExpressionsMapper(dict(zip(val_free_dims, var_bound_dims)))
+        return mapper(val)
+
+    # Get local variable declarations and hoist them
+    decls = FindNodes(VariableDeclaration).visit(member.spec)
+    decls = tuple(d for d in decls if all(not s.type.intent for s in d.symbols))
+    decls = tuple(d for d in decls if all(s not in routine.variables for s in d.symbols))
+    routine.spec.append(decls)
+
+    call_map = {}
+    for call in FindNodes(CallStatement).visit(routine.body):
+        if call.routine == member:
+            argmap = {}
+            member_vars = FindVariables().visit(member.body)
+
+            # Match dimension indexes between the argument and the given value
+            # for all occurences of the argument in the body
+            for arg, val in call.arg_map.items():
+                if isinstance(arg, sym.Array):
+                    # Resolve implicit dimension ranges of the passed value,
+                    # eg. when passing a two-dimensional array `a` as `call(arg=a)`
+                    qualified_value = val if val.dimensions else val.clone(
+                        dimensions=tuple(sym.Range((None, None)) for _ in arg.shape)
+                    )
+                    arg_vars = tuple(v for v in member_vars if v.name == arg.name)
+                    argmap.update((v, _map_unbound_dims(v, qualified_value)) for v in arg_vars)
+                else:
+                    argmap[arg] = val
+
+            # Substitute argument calls into a copy of the body
+            member_body = SubstituteExpressions(argmap).visit(member.body.body)
+
+            # Inline substituted body within a pair of marker comments
+            comment = Comment(f'! [Loki] inlined member subroutine: {member.name}')
+            c_line = Comment('! =========================================')
+            call_map[call] = (comment, c_line) + as_tuple(member_body) + (c_line, )
+
+    # Replace calls to member with the member's body
+    routine.body = Transformer(call_map).visit(routine.body)
+    # Can't use transformer to replace subroutine, so strip it manually
+    contains_body = tuple(n for n in routine.contains.body if not n == member)
+    routine.contains._update(body=contains_body)
+
+
+def inline_member_procedures(routine):
+    """
+    Inline all member subroutines contained in an individual :any:`Subroutine`.
+
+    Please note that member functions are not yet supported!
+
+    Parameters
+    ----------
+    routine : :any:`Subroutine`
+        The subroutine in which to inline all member routines
+    """
+
+    # Run through all members and invoke individual inlining transforms
+    for member in routine.members:
+        if member.is_function:
+            # TODO: Implement for functions!!!
+            warning('[Loki::inline] Inlining member functions is not yet supported, only subroutines!')
+        else:
+            inline_member_routine(routine, member)
