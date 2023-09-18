@@ -20,6 +20,7 @@ from loki.types import BasicType
 from loki.visitors import Transformer, FindNodes
 from loki.tools import as_tuple
 from loki.logging import warning
+from loki.transform import recursive_expression_map_update
 
 
 __all__ = [
@@ -218,14 +219,23 @@ def inline_member_routine(routine, member):
         For example, mapping the passed array ``m(:,j)`` to the local
         expression ``a(i)`` yields ``m(i,j)``.
         """
-        val_free_dims = tuple(d for d in val.dimensions if isinstance(d, sym.Range))
-        var_bound_dims = tuple(d for d in var.dimensions if not isinstance(d, sym.Range))
-        mapper = SubstituteExpressionsMapper(dict(zip(val_free_dims, var_bound_dims)))
-        return mapper(val)
+        new_dimensions = list(val.dimensions)
+
+        indices = [index for index, dim in enumerate(val.dimensions) if isinstance(dim, sym.Range)]
+
+        for index, dim in enumerate(var.dimensions):
+            new_dimensions[indices[index]] = dim
+
+        original_symbol = sym.ArraySubscript(val.symbol, val.dimensions)
+        new_symbol = sym.ArraySubscript(val.symbol, tuple(new_dimensions) )
+
+        mapper = SubstituteExpressionsMapper({original_symbol:new_symbol})
+
+        return mapper(original_symbol)
 
     # Get local variable declarations and hoist them
     decls = FindNodes(VariableDeclaration).visit(member.spec)
-    decls = tuple(d for d in decls if all(not s.type.intent for s in d.symbols))
+    decls = tuple(d for d in decls if all(s.name not in routine._dummies for s in d.symbols))
     decls = tuple(d for d in decls if all(s not in routine.variables for s in d.symbols))
     routine.spec.append(decls)
 
@@ -241,13 +251,20 @@ def inline_member_routine(routine, member):
                 if isinstance(arg, sym.Array):
                     # Resolve implicit dimension ranges of the passed value,
                     # eg. when passing a two-dimensional array `a` as `call(arg=a)`
-                    qualified_value = val if val.dimensions else val.clone(
-                        dimensions=tuple(sym.Range((None, None)) for _ in arg.shape)
-                    )
+                    # Check if val is a DeferredTypeSymbol, as it does not have a `dimensions` attribute
+                    if not isinstance(val, sym.DeferredTypeSymbol) and val.dimensions:
+                        qualified_value = val
+                    else:
+                        qualified_value = val.clone(
+                            dimensions=tuple(sym.Range((None, None)) for _ in arg.shape)
+                        )
                     arg_vars = tuple(v for v in member_vars if v.name == arg.name)
                     argmap.update((v, _map_unbound_dims(v, qualified_value)) for v in arg_vars)
                 else:
                     argmap[arg] = val
+
+            # Recursive update of the map in case of nested variables to map
+            argmap = recursive_expression_map_update(argmap, max_iterations=10)
 
             # Substitute argument calls into a copy of the body
             member_body = SubstituteExpressions(argmap).visit(member.body.body)
