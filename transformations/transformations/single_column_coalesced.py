@@ -5,7 +5,7 @@
 # granted to it by virtue of its status as an intergovernmental organisation
 # nor does it submit to any jurisdiction.
 
-import re
+import re 
 from loki.expression import symbols as sym
 from loki.transform import resolve_associates, inline_member_procedures
 from loki import (
