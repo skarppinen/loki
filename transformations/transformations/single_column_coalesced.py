@@ -13,10 +13,11 @@ from loki import (
     pragmas_attached, as_tuple, flatten, ir, FindExpressions,
     SymbolAttributes, BasicType, SubstituteExpressions, DerivedType,
     FindVariables, CaseInsensitiveDict, pragma_regions_attached,
-    PragmaRegion, is_loki_pragma
+    PragmaRegion, is_loki_pragma, Allocation, Deallocation
 )
 from loki.transform import (
     HoistVariablesTransformation,
+    HoistTemporaryArraysTransformationAllocatable,
     single_variable_declaration
 )
 
@@ -731,8 +732,15 @@ class RecursiveSCCHoistTransformation(Transformation):
         block_var = SCCBaseTransformation.get_integer_variable(routine, block_dim.size)
         arg_dims = [v.shape + (block_var,) for v in column_locals]
         # Translate shape variables back to caller's namespace
-        routine.variables += as_tuple(v.clone(dimensions=arg_mapper.visit(dims), scope=routine)
-                                      for v, dims in zip(column_locals, arg_dims))
+        #routine.variables += as_tuple(v.clone(dimensions=arg_mapper.visit(dims), scope=routine)
+        #                              for v, dims in zip(column_locals, arg_dims))
+
+        # TODO: For allocatables, undocument here. And fix dimensions, one dim short. 
+        for var, dims in zip(column_locals, arg_dims):
+            routine.variables += tuple([var.clone(scope=routine, dimensions=as_tuple(
+                [sym.RangeIndex((None, None))] * len(dims)), type = var.type.clone(allocatable=True))])
+            routine.body.prepend(Allocation((var.clone(dimensions = dims),)))
+            routine.body.append(Deallocation((var.clone(dimensions=None),)))
 
         # Add column_locals to trafo_data for offload annotations in SCCAnnotate
         if item:
@@ -799,6 +807,7 @@ class RecursiveSCCHoistTransformation(Transformation):
             if item:
                 item.trafo_data[self._key] = {'column_locals': []}
             targets = item.targets 
+
             # Apply hoisting of temporary "column arrays"
             for call in FindNodes(ir.CallStatement).visit(routine.body):
                 if not call.name in targets:
