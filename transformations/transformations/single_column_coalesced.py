@@ -6,14 +6,17 @@
 # nor does it submit to any jurisdiction.
 
 import re
-from loki.expression import symbols as sym
+from loki.expression import (
+    symbols as sym, FindTypedSymbols, 
+)
 from loki.transform import resolve_associates, inline_member_procedures
 from loki import (
     Transformation, FindNodes, FindScopes, Transformer, info,
     pragmas_attached, as_tuple, flatten, ir, FindExpressions,
     SymbolAttributes, BasicType, SubstituteExpressions, DerivedType,
     FindVariables, CaseInsensitiveDict, pragma_regions_attached,
-    PragmaRegion, is_loki_pragma, Allocation, Deallocation
+    PragmaRegion, is_loki_pragma, Allocation, Deallocation,
+    recursive_expression_map_update
 )
 from loki.transform import (
     HoistVariablesTransformation,
@@ -775,9 +778,6 @@ class RecursiveSCCHoistTransformation(Transformation):
         routine.body = Transformer(call_map).visit(routine.body)
 
     def transform_subroutine(self, routine, **kwargs):
-        """
-        TODO: Document + Assumes trafo_data populated
-        """
 
         item = kwargs.get('item', None)
         role = item.role 
@@ -803,6 +803,24 @@ class RecursiveSCCHoistTransformation(Transformation):
             # Separate all variable declarations to their own lines. 
             # This would not be strictly necessary, but is done to avoid errors when writing transformed source.
             single_variable_declaration(routine)
+            
+            # Change all kernels to use the "long names" of the variables in `trafo_data`'s 'hoist_variables'.
+            # This is because otherwise the data offload annotations by SCCAnnotate will be wrong in the kernels,
+            # (i.e using short names) even though the wrapper uses the long names in 'acc create'. 
+            # The following lines rename each short variable name to long variable name.
+            to_hoist_names = [v.name.lower() for v in item.trafo_data['HoistVariablesTransformation']['to_hoist']]
+            hoist_vars_names = [v.name.lower() for v in item.trafo_data['HoistVariablesTransformation']['hoist_variables']]
+            for src, dest in zip(to_hoist_names, hoist_vars_names): 
+                name_vars = [v for v in FindTypedSymbols().visit(routine.ir) if v == src]
+                expr_map = {v: v.clone(name=dest) for v in name_vars}
+                expr_map = recursive_expression_map_update(expr_map)
+                for e in expr_map:
+                    v = expr_map[e]
+                    expr_map[e] = v.clone(type = v.type.clone(intent = 'inout'))
+                routine._dummies = [dest if arg.lower() == src else arg for arg in routine._dummies]
+                routine.spec = SubstituteExpressions(expr_map).visit(routine.spec)
+                routine.body = SubstituteExpressions(expr_map).visit(routine.body)
+
         else: 
             if item:
                 item.trafo_data[self._key] = {'column_locals': []}
