@@ -737,7 +737,6 @@ class RecursiveSCCHoistTransformation(Transformation):
         # Translate shape variables back to caller's namespace
         routine.variables += as_tuple(v.clone(dimensions=arg_mapper.visit(dims), scope=routine)
                                       for v, dims in zip(column_locals, arg_dims))
-        print("blep!!")
 
         # TODO: For allocatables, undocument here. And fix dimensions, one dim short. 
         #for var, dims in zip(column_locals, arg_dims):
