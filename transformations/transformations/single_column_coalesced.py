@@ -634,10 +634,11 @@ def filter_column_locals(variables, vertical):
 class RecursiveSCCHoistTransformation(Transformation):
     _key = "SCCHoistTransformation" 
 
-    def __init__(self, horizontal, vertical, block_dim):
+    def __init__(self, horizontal, vertical, block_dim, use_allocatables):
         self.horizontal = horizontal
         self.vertical = vertical
         self.block_dim = block_dim
+        self.use_allocatables = use_allocatables
             
 
     @classmethod
@@ -683,7 +684,8 @@ class RecursiveSCCHoistTransformation(Transformation):
         routine.arguments += as_tuple(new_v)
 
     @classmethod
-    def hoist_driver_temporary_arrays(cls, routine, call, horizontal, vertical, block_dim, item=None):
+    def hoist_driver_temporary_arrays(cls, routine, call, horizontal, vertical, block_dim, 
+                                      use_allocatables = False, item=None):
         """
         Hoist temporary column arrays to the driver level.
 
@@ -735,15 +737,16 @@ class RecursiveSCCHoistTransformation(Transformation):
         block_var = SCCBaseTransformation.get_integer_variable(routine, block_dim.size)
         arg_dims = [v.shape + (block_var,) for v in column_locals]
         # Translate shape variables back to caller's namespace
-        routine.variables += as_tuple(v.clone(dimensions=arg_mapper.visit(dims), scope=routine)
+        if not use_allocatables:
+            routine.variables += as_tuple(v.clone(dimensions=arg_mapper.visit(dims), scope=routine)
                                       for v, dims in zip(column_locals, arg_dims))
-
-        # TODO: For allocatables, undocument here. And fix dimensions, one dim short. 
-        #for var, dims in zip(column_locals, arg_dims):
-        #    routine.variables += tuple([var.clone(scope=routine, dimensions=as_tuple(
-        #        [sym.RangeIndex((None, None))] * len(dims)), type = var.type.clone(allocatable=True))])
-        #    routine.body.prepend(Allocation((var.clone(dimensions = dims),)))
-        #    routine.body.append(Deallocation((var.clone(dimensions=None),)))
+        else: 
+            # TODO: This is very slow.
+            for var, dims in zip(column_locals, arg_dims):
+                routine.variables += tuple([var.clone(scope=routine, dimensions=as_tuple(
+                    [sym.RangeIndex((None, None))] * len(dims)), type = var.type.clone(allocatable=True))])
+                routine.body.prepend(Allocation((var.clone(dimensions = dims),)))
+                routine.body.append(Deallocation((var.clone(dimensions=None),)))
 
         # Add column_locals to trafo_data for offload annotations in SCCAnnotate
         if item:
@@ -831,7 +834,7 @@ class RecursiveSCCHoistTransformation(Transformation):
                 if not call.name in targets:
                     continue
                 self.hoist_driver_temporary_arrays(routine, call, self.horizontal, self.vertical,
-                                                   self.block_dim, item=item)
+                                                   self.block_dim, self.use_allocatables, item=item)
    
 class SCCHoistTransformation(Transformation):
     """
