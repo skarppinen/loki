@@ -5,15 +5,10 @@
 # granted to it by virtue of its status as an intergovernmental organisation
 # nor does it submit to any jurisdiction.
 
-<<<<<<< HEAD
-import re 
-from loki.expression import symbols as sym
-=======
 import re
 from loki.expression import (
     symbols as sym, FindTypedSymbols, 
 )
->>>>>>> recursive-scc-hoist
 from loki.transform import resolve_associates, inline_member_procedures
 from loki import (
     Transformation, FindNodes, FindScopes, Transformer, info,
