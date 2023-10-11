@@ -5,18 +5,27 @@
 # granted to it by virtue of its status as an intergovernmental organisation
 # nor does it submit to any jurisdiction.
 
+<<<<<<< HEAD
 import re 
 from loki.expression import symbols as sym
+=======
+import re
+from loki.expression import (
+    symbols as sym, FindTypedSymbols, 
+)
+>>>>>>> recursive-scc-hoist
 from loki.transform import resolve_associates, inline_member_procedures
 from loki import (
     Transformation, FindNodes, FindScopes, Transformer, info,
     pragmas_attached, as_tuple, flatten, ir, FindExpressions,
     SymbolAttributes, BasicType, SubstituteExpressions, DerivedType,
     FindVariables, CaseInsensitiveDict, pragma_regions_attached,
-    PragmaRegion, is_loki_pragma
+    PragmaRegion, is_loki_pragma, Allocation, Deallocation,
+    recursive_expression_map_update
 )
 from loki.transform import (
     HoistVariablesTransformation,
+    HoistTemporaryArraysTransformationAllocatable,
     single_variable_declaration
 )
 
@@ -630,10 +639,11 @@ def filter_column_locals(variables, vertical):
 class RecursiveSCCHoistTransformation(Transformation):
     _key = "SCCHoistTransformation" 
 
-    def __init__(self, horizontal, vertical, block_dim):
+    def __init__(self, horizontal, vertical, block_dim, use_allocatables):
         self.horizontal = horizontal
         self.vertical = vertical
         self.block_dim = block_dim
+        self.use_allocatables = use_allocatables
             
 
     @classmethod
@@ -679,7 +689,8 @@ class RecursiveSCCHoistTransformation(Transformation):
         routine.arguments += as_tuple(new_v)
 
     @classmethod
-    def hoist_driver_temporary_arrays(cls, routine, call, horizontal, vertical, block_dim, item=None):
+    def hoist_driver_temporary_arrays(cls, routine, call, horizontal, vertical, block_dim, 
+                                      use_allocatables = False, item=None):
         """
         Hoist temporary column arrays to the driver level.
 
@@ -731,8 +742,16 @@ class RecursiveSCCHoistTransformation(Transformation):
         block_var = SCCBaseTransformation.get_integer_variable(routine, block_dim.size)
         arg_dims = [v.shape + (block_var,) for v in column_locals]
         # Translate shape variables back to caller's namespace
-        routine.variables += as_tuple(v.clone(dimensions=arg_mapper.visit(dims), scope=routine)
+        if not use_allocatables:
+            routine.variables += as_tuple(v.clone(dimensions=arg_mapper.visit(dims), scope=routine)
                                       for v, dims in zip(column_locals, arg_dims))
+        else: 
+            # TODO: This is very slow.
+            for var, dims in zip(column_locals, arg_dims):
+                routine.variables += tuple([var.clone(scope=routine, dimensions=as_tuple(
+                    [sym.RangeIndex((None, None))] * len(dims)), type = var.type.clone(allocatable=True))])
+                routine.body.prepend(Allocation((var.clone(dimensions = dims),)))
+                routine.body.append(Deallocation((var.clone(dimensions=None),)))
 
         # Add column_locals to trafo_data for offload annotations in SCCAnnotate
         if item:
@@ -767,9 +786,6 @@ class RecursiveSCCHoistTransformation(Transformation):
         routine.body = Transformer(call_map).visit(routine.body)
 
     def transform_subroutine(self, routine, **kwargs):
-        """
-        TODO: Document + Assumes trafo_data populated
-        """
 
         item = kwargs.get('item', None)
         role = item.role 
@@ -795,16 +811,35 @@ class RecursiveSCCHoistTransformation(Transformation):
             # Separate all variable declarations to their own lines. 
             # This would not be strictly necessary, but is done to avoid errors when writing transformed source.
             single_variable_declaration(routine)
+            
+            # Change all kernels to use the "long names" of the variables in `trafo_data`'s 'hoist_variables'.
+            # This is because otherwise the data offload annotations by SCCAnnotate will be wrong in the kernels,
+            # (i.e using short names) even though the wrapper uses the long names in 'acc create'. 
+            # The following lines rename each short variable name to long variable name.
+            to_hoist_names = [v.name.lower() for v in item.trafo_data['HoistVariablesTransformation']['to_hoist']]
+            hoist_vars_names = [v.name.lower() for v in item.trafo_data['HoistVariablesTransformation']['hoist_variables']]
+            for src, dest in zip(to_hoist_names, hoist_vars_names): 
+                name_vars = [v for v in FindTypedSymbols().visit(routine.ir) if v == src]
+                expr_map = {v: v.clone(name=dest) for v in name_vars}
+                expr_map = recursive_expression_map_update(expr_map)
+                for e in expr_map:
+                    v = expr_map[e]
+                    expr_map[e] = v.clone(type = v.type.clone(intent = 'inout'))
+                routine._dummies = [dest if arg.lower() == src else arg for arg in routine._dummies]
+                routine.spec = SubstituteExpressions(expr_map).visit(routine.spec)
+                routine.body = SubstituteExpressions(expr_map).visit(routine.body)
+
         else: 
             if item:
                 item.trafo_data[self._key] = {'column_locals': []}
             targets = item.targets 
+
             # Apply hoisting of temporary "column arrays"
             for call in FindNodes(ir.CallStatement).visit(routine.body):
                 if not call.name in targets:
                     continue
                 self.hoist_driver_temporary_arrays(routine, call, self.horizontal, self.vertical,
-                                                   self.block_dim, item=item)
+                                                   self.block_dim, self.use_allocatables, item=item)
    
 class SCCHoistTransformation(Transformation):
     """
