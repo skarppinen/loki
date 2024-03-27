@@ -79,6 +79,7 @@ class InlineTransformation(Transformation):
 
     # Ensure correct recursive inlining by traversing from the leaves
     reverse_traversal = True
+    creates_items = True
 
     def __init__(
             self, inline_constants=False, inline_elementals=True,
