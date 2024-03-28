@@ -121,12 +121,14 @@ def cli(debug):
               help="Recursively derive explicit shape dimension for argument arrays")
 @click.option('--eliminate-dead-code/--no-eliminate-dead-code', default=True,
               help='Perform dead code elimination, where unreachable branches are trimmed from the code.')
+@click.option('--cray-ptr-loc-rhs/--no-cray-ptr-loc-rhs', default=False,
+              help='Perform dead code elimination, where unreachable branches are trimmed from the code.')
 def convert(
         mode, config, build, source, header, cpp, directive, include, define, omni_include, xmod,
         data_offload, remove_openmp, assume_deviceptr, frontend, trim_vector_sections,
         global_var_offload, remove_derived_args, inline_members, inline_marked,
         resolve_sequence_association, resolve_sequence_association_inlined_calls,
-        derive_argument_array_shape, eliminate_dead_code
+        derive_argument_array_shape, eliminate_dead_code, cray_ptr_loc_rhs
 ):
     """
     Batch-processing mode for Fortran-to-Fortran transformations that
@@ -282,7 +284,8 @@ def convert(
 
         directive = {'idem-stack': 'openmp', 'scc-stack': 'openacc'}[mode]
         scheduler.process(transformation=TemporariesPoolAllocatorTransformation(
-            block_dim=block_dim, directive=directive, check_bounds='scc' not in mode
+            block_dim=block_dim, directive=directive, check_bounds='scc' not in mode,
+            cray_ptr_loc_rhs=cray_ptr_loc_rhs
         ))
 
     if mode == 'cuf-parametrise':
